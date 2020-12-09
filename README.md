@@ -1,6 +1,9 @@
 # kafkachannel-subscription-ready-before-partition-consumers-started
 Reproducer for a knative eventing kafkachannel issue
 
+TLDR:
+* `make test`
+
 Prerequisites:
 * Make sure `ko` exists
 
