@@ -1,0 +1,23 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: sender
+  namespace: foobar
+  labels:
+    app: sender
+    bindings.knative.dev/include: "true"
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/maxScale: "1"
+        autoscaling.knative.dev/minScale: "1"
+    spec:
+      containers:
+        - image: ko://github.com/maschmid/kafkachannel-subscription-ready-before-partition-consumers-started/sender
+          # TODO: use downward API if supported by serving
+          env:
+          - name: POD_NAME
+            value: sender
+          - name: POD_NAMESPACE
+            value: foobar
