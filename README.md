@@ -20,7 +20,6 @@ The test then invokes the sender ksvc to start producing events (1000 in total).
 When the issue occurs, the first N events will not be received:
 
 ```
-    reproducer_test.go:353: Event with ID 0 should be received exactly once, was 0
     reproducer_test.go:353: Event with ID 1 should be received exactly once, was 0
     reproducer_test.go:353: Event with ID 2 should be received exactly once, was 0
     reproducer_test.go:353: Event with ID 3 should be received exactly once, was 0

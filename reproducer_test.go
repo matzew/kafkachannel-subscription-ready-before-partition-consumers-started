@@ -354,8 +354,8 @@ func TestSubscriptionReadyBeforeConsumerGroups(t *testing.T) {
 	time.Sleep(1 * time.Minute)
 
 	counts := getReceiverReport(t, receiverUrl.String()+"/report")
-	// Every number between <0 and 1000) should be received exactly once
-	for i := 0; i < 1000; i++ {
+	// Every number between <1 and 1000> should be received exactly once
+	for i := 1; i <= 1000; i++ {
 		if counts[i] != 1 {
 			t.Errorf("Event with ID %d should be received exactly once, was %d", i, counts[i])
 		}
