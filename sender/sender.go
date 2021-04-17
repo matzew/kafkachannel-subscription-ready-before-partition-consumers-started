@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	cloudevents "github.com/cloudevents/sdk-go/v2"
 	"io"
@@ -13,6 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+const retryInterval = 5 * time.Millisecond
 
 type sendCommand struct {
 	sink     string
@@ -100,7 +101,9 @@ func (cmd *sendCommand) invoke() error {
 					s := fmt.Sprintf("error sending event %d/%d: %v\n", i, cmd.count, result)
 					log.Print(s)
 
-					return errors.New(s)
+					// In case of error, sleep for a retryInterval and try again until successful
+					time.Sleep(retryInterval)
+					// return errors.New(s)
 				} else {
 					break
 				}

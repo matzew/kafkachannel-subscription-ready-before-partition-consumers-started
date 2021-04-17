@@ -27,6 +27,12 @@ import (
 	"time"
 )
 
+const (
+	namespace = "foobar"
+	sender = "sender"
+	receiver = "receiver"
+)
+
 // TODO: use helpers
 // Cannot use pkg test helpers due to flag conflicts
 func appendRandomString(prefix string) string {
@@ -42,6 +48,42 @@ func randomString() string {
 		suffix[i] = letterBytes[rand.Intn(len(letterBytes))]
 	}
 	return string(suffix)
+}
+
+func prepareClients(t *testing.T) (*testlib.Client, *servingversioned.Clientset, *eventingcontribkafkachannelversioned.Clientset){
+	client, err := testlib.NewClient(
+		pkgTest.Flags.Kubeconfig,
+		pkgTest.Flags.Cluster,
+		namespace,
+		t)
+	if err != nil {
+		t.Fatalf("Error creating Eventing test/lib Client: %v", err)
+	}
+
+	servingClient, err := servingversioned.NewForConfig(client.Config)
+	if err != nil {
+		t.Fatalf("Error creating Serving Client: %v", err)
+	}
+
+	kafkaClientSet, err := eventingcontribkafkachannelversioned.NewForConfig(client.Config)
+	if err != nil {
+		t.Fatalf("Error creating Kafka ClientSet: %v", err)
+	}
+
+	return client, servingClient, kafkaClientSet
+}
+
+func resetReceiver(t *testing.T, resetUrl string) {
+	resp, err := http.Post(resetUrl, "text/plain", nil)
+	if err != nil {
+		t.Fatalf("error HTTP POST %s: %v", resetUrl, err)
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status for HTTP POST %s: %s", resetUrl, resp.Status)
+	}
 }
 
 // Returns a map of count of received messages, per "index", and the number of errors
@@ -148,57 +190,33 @@ func waitForKsvcReadiness(t *testing.T, servingClient *servingversioned.Clientse
 	})
 }
 
-/*
-TestSubscriptionReadyBeforeConsumerGroups expects that "make apply" was invoked before
-(it uses the sender and receiver ksvcs created in "foobar" namespace by "make apply")
-*/
-func TestSubscriptionReadyBeforeConsumerGroups(t *testing.T) {
-	const namespace = "foobar"
-	const sender = "sender"
-	const receiver = "receiver"
-
-	rand.Seed(time.Now().UnixNano())
-
-	// The issue seems to be happening only when the channel is "fresh", (it was not created before)
-	// So we generate a random name for the channel and the subscription:
-	subscriptionName := appendRandomString("subscription")
-	channelName := appendRandomString("channel")
-
-	client, err := testlib.NewClient(
-		pkgTest.Flags.Kubeconfig,
-		pkgTest.Flags.Cluster,
-		namespace,
-		t)
-
-	servingClient, err := servingversioned.NewForConfig(client.Config)
-	if err != nil {
-		t.Fatalf("Error creating Serving Client: %v", err)
-	}
-
-	kafkaClientSet, err := eventingcontribkafkachannelversioned.NewForConfig(client.Config)
-	if err != nil {
-		t.Fatalf("Error creating Kafka ClientSet: %v", err)
-	}
-
+// Prepares receiver ksvc
+func prepareReceiver(t *testing.T, servingClient *servingversioned.Clientset) string {
 	// Wait until the "receiver" ksvc becomes Ready  (sender ksvc won't become ready until we create the SinkBinding)
-	err = waitForKsvcReadiness(t, servingClient, namespace, receiver)
+	err := waitForKsvcReadiness(t, servingClient, namespace, receiver)
 	if err != nil {
 		t.Fatalf("Error waiting for ksvc %q readiness: %v", receiver, err)
 	}
 	// Get the receiver URL
-	service, err := servingClient.ServingV1().Services(namespace).Get(context.Background(), receiver, meta.GetOptions{})
+	svc, err := servingClient.ServingV1().Services(namespace).Get(context.Background(), receiver, meta.GetOptions{})
 	if err != nil {
 		t.Fatalf("Error getting ksvc %q: %v", receiver, err)
 	}
-	receiverUrl := service.Status.URL
+	receiverUrl := svc.Status.URL
 
 	err = waitForNo503(receiverUrl.String())
 	if err != nil {
 		t.Fatalf("error waiting for the OpenShift route for ksvc %s", receiver)
 	}
 
-	// Create the KafkaChannel
-	_, err = kafkaClientSet.MessagingV1beta1().KafkaChannels(namespace).Create(context.Background(), &kafkachannel.KafkaChannel{
+	// Reset the receiver (in case we're re-running the test)
+	resetReceiver(t, receiverUrl.String()+"/reset")
+
+	return receiverUrl.String()
+}
+
+func createChannel(t *testing.T, kafkaClientSet *eventingcontribkafkachannelversioned.Clientset, channelName string) {
+	_, err := kafkaClientSet.MessagingV1beta1().KafkaChannels(namespace).Create(context.Background(), &kafkachannel.KafkaChannel{
 		ObjectMeta: meta.ObjectMeta{
 			Name: channelName,
 		},
@@ -210,9 +228,11 @@ func TestSubscriptionReadyBeforeConsumerGroups(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error creating KafkaChannel %q: %v", channelName, err)
 	}
+}
 
+func prepareSender(t *testing.T, client *testlib.Client, servingClient *servingversioned.Clientset, channelName string) string {
 	// Label the namespace for the SinkBinding
-	_, err = client.Kube.Kube.CoreV1().Namespaces().Patch(context.Background(), namespace, types.StrategicMergePatchType, []byte("{ \"metadata\": { \"labels\": { \"bindings.knative.dev/include\": \"true\" } } }"), meta.PatchOptions{})
+	_, err := client.Kube.Kube.CoreV1().Namespaces().Patch(context.Background(), namespace, types.StrategicMergePatchType, []byte("{ \"metadata\": { \"labels\": { \"bindings.knative.dev/include\": \"true\" } } }"), meta.PatchOptions{})
 	if err != nil {
 		t.Fatalf("error patching namespace %q: %v", namespace, err)
 	}
@@ -257,11 +277,11 @@ func TestSubscriptionReadyBeforeConsumerGroups(t *testing.T) {
 	}
 
 	// Get the sender URL
-	service, err = servingClient.ServingV1().Services(namespace).Get(context.Background(), sender, meta.GetOptions{})
+	svc, err := servingClient.ServingV1().Services(namespace).Get(context.Background(), sender, meta.GetOptions{})
 	if err != nil {
 		t.Fatalf("Error getting ksvc %q: %v", sender, err)
 	}
-	senderUrl := service.Status.URL
+	senderUrl := svc.Status.URL
 
 	// Waits until the sender OpenShift Route exists
 	err = waitForNo503(senderUrl.String())
@@ -269,8 +289,13 @@ func TestSubscriptionReadyBeforeConsumerGroups(t *testing.T) {
 		t.Fatalf("error waiting for the OpenShift route for ksvc %s", sender)
 	}
 
+	return senderUrl.String()
+}
+
+// creates Subscription and wait until it's Ready (subscription is marked as ready in the Channel subscription list)
+func prepareSubscription(t *testing.T, client *testlib.Client, kafkaClientSet *eventingcontribkafkachannelversioned.Clientset, subscriptionName string, channelName string) {
 	// Create the Subscription
-	_, err = client.Eventing.MessagingV1().Subscriptions(namespace).Create(context.Background(), &messaging.Subscription{
+	_, err := client.Eventing.MessagingV1().Subscriptions(namespace).Create(context.Background(), &messaging.Subscription{
 		ObjectMeta: meta.ObjectMeta{
 			Name: subscriptionName,
 		},
@@ -330,9 +355,13 @@ func TestSubscriptionReadyBeforeConsumerGroups(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error waiting for channel %q readiness: %v", channelName, err)
 	}
+}
 
+func sendEvents(t *testing.T, senderUrl string) {
+	t.Logf("Sending events...")
 	// Invoke the sender (let it send 1000 events, with 20ms interval between events)
-	resp, err := http.Post(senderUrl.String()+"/send?count=1000&interval=20ms", "text/plain", nil)
+	// The sender will retry if it cannot send an event
+	resp, err := http.Post(senderUrl + "/send?count=1000&interval=20ms", "text/plain", nil)
 	if err != nil {
 		t.Fatalf("Error invoking sender: %v", err)
 	}
@@ -348,16 +377,99 @@ func TestSubscriptionReadyBeforeConsumerGroups(t *testing.T) {
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("HTTP POST to sender returned %v", resp.Status)
 	}
+}
 
-	// 1000 messages with 20ms (50 events/s) => ~20 seconds, let's wait for a minute to let all the events be delivered
-	t.Logf("Sleeping for a minute to let the events flow...")
-	time.Sleep(1 * time.Minute)
-
-	counts := getReceiverReport(t, receiverUrl.String()+"/report")
+func verifyEventsReceived(t *testing.T, receiverUrl string) {
+	counts := getReceiverReport(t, receiverUrl + "/report")
 	// Every number between <1 and 1000> should be received exactly once
 	for i := 1; i <= 1000; i++ {
 		if counts[i] != 1 {
 			t.Errorf("Event with ID %d should be received exactly once, was %d", i, counts[i])
 		}
 	}
+}
+
+/*
+TestSubscriptionReadyBeforeConsumerGroups expects that "make apply" was invoked before
+(it uses the sender and receiver ksvcs created in "foobar" namespace by "make apply")
+*/
+func TestSubscriptionReadyBeforeConsumerGroups(t *testing.T) {
+	rand.Seed(time.Now().UnixNano())
+
+	// The issue seems to be happening only when the channel is "fresh", (it was not created before)
+	// So we generate a random name for the channel and the subscription:
+	subscriptionName := appendRandomString("subscription")
+	channelName := appendRandomString("channel")
+
+	client, servingClient, kafkaClientSet := prepareClients(t)
+
+	receiverUrl := prepareReceiver(t, servingClient)
+
+	// Create the KafkaChannel
+	createChannel(t, kafkaClientSet, channelName)
+
+	// Create the SinkBinding for the Sender and waits until Sender is Ready
+	senderUrl := prepareSender(t, client, servingClient, channelName)
+
+	// Creates Subscription and wait until it is Ready (and marked as ready in channel subscriber list)
+	prepareSubscription(t, client, kafkaClientSet, subscriptionName, channelName)
+
+	sendEvents(t, senderUrl)
+
+	// 1000 messages with 20ms (50 events/s) => ~20 seconds, let's wait for a minute to let all the events be delivered
+	t.Logf("Sleeping for a minute to let the events flow...")
+	time.Sleep(1 * time.Minute)
+
+	verifyEventsReceived(t, receiverUrl)
+}
+
+
+/*
+TestConsumerGroupsNotReadyAfterDispatcherRestart expects that "make apply" was invoked before
+(it uses the sender and receiver ksvcs created in "foobar" namespace by "make apply")
+*/
+func TestConsumerGroupsNotReadyAfterDispatcherRestart(t *testing.T) {
+	rand.Seed(time.Now().UnixNano())
+
+	// The issue seems to be happening only when the channel is "fresh", (it was not created before)
+	// So we generate a random name for the channel and the subscription:
+	subscriptionName := appendRandomString("subscription")
+	channelName := appendRandomString("channel")
+
+	client, servingClient, kafkaClientSet := prepareClients(t)
+
+	receiverUrl := prepareReceiver(t, servingClient)
+
+	// Create the KafkaChannel
+	createChannel(t, kafkaClientSet, channelName)
+
+	// Create the SinkBinding for the Sender and waits until Sender is Ready
+	senderUrl := prepareSender(t, client, servingClient, channelName)
+
+	// Creates Subscription and wait until it is Ready (and marked as ready in channel subscriber list)
+	prepareSubscription(t, client, kafkaClientSet, subscriptionName, channelName)
+
+	// Delete the kafka-ch-dispatcher pod
+	kafkaDispatcherList, err := client.Kube.Kube.CoreV1().Pods("knative-eventing").List(
+		context.Background(),
+		meta.ListOptions{LabelSelector: "messaging.knative.dev/channel=kafka-channel,messaging.knative.dev/role=dispatcher"})
+	if err != nil {
+		t.Fatal("Error listing knative-eventing kafka-ch-dispatcher pods", err)
+	}
+
+	for _, kafkaDispatcher := range kafkaDispatcherList.Items {
+		t.Log("Deleting Pod", kafkaDispatcher.Name)
+		err = client.Kube.Kube.CoreV1().Pods("knative-eventing").Delete(context.Background(), kafkaDispatcher.Name, meta.DeleteOptions{})
+		if err != nil {
+			t.Fatal("Error deleting", kafkaDispatcher.Name, err)
+		}
+	}
+
+	sendEvents(t, senderUrl)
+
+	// 1000 messages with 20ms (50 events/s) => ~20 seconds, let's wait for a minute to let all the events be delivered
+	t.Logf("Sleeping for a minute to let the events flow...")
+	time.Sleep(1 * time.Minute)
+
+	verifyEventsReceived(t, receiverUrl)
 }

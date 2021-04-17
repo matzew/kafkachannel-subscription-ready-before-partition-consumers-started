@@ -6,6 +6,7 @@ import (
 	"fmt"
 	cloudevents "github.com/cloudevents/sdk-go/v2"
 	"github.com/cloudevents/sdk-go/v2/event"
+	"io"
 	"log"
 	"net/http"
 	"sync"
@@ -13,7 +14,6 @@ import (
 
 var (
 	idCounts map[string]uint64
-	events   uint64
 
 	// Guards indexCounts, events, indexRejectCounts and error counters
 	mux sync.RWMutex
@@ -31,6 +31,16 @@ func receive(event event.Event) error {
 	log.Printf("%s received", event.ID())
 
 	return nil
+}
+
+func reset(w http.ResponseWriter, r *http.Request) {
+	mux.Lock()
+	idCounts = make(map[string]uint64)
+	mux.Unlock()
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, "ok")
 }
 
 func report(w http.ResponseWriter, r *http.Request) {
@@ -70,6 +80,7 @@ func main() {
 		log.Fatalf("failed to create client, %v", err)
 	}
 
+	router.HandleFunc("/reset", reset)
 	router.HandleFunc("/report", report)
 
 	log.Printf("will listen on :8080\n")
