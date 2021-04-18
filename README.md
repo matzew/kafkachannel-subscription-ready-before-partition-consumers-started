@@ -30,5 +30,5 @@ When the issue occurs, the first N events will not be received:
 ...
 ```
 
-TestConsumerGroupsNotReadyAfterDispatcherRestart is a variant of the same test, but it also restarts (deletes pod of) kafka-ch-dispatcher
+TestDispatcherRestartBeforeCommitedEvents is a variant of the same test, but it also restarts (deletes pod of) kafka-ch-dispatcher
 once the Subscription is ready.

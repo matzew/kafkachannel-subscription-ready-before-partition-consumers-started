@@ -3,6 +3,7 @@ package kafkachannel_subscription_ready_before_partition_consumers_started
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"io/ioutil"
 	core "k8s.io/api/core/v1"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -357,11 +358,11 @@ func prepareSubscription(t *testing.T, client *testlib.Client, kafkaClientSet *e
 	}
 }
 
-func sendEvents(t *testing.T, senderUrl string) {
+func sendEvents(t *testing.T, senderUrl string, count int) {
 	t.Logf("Sending events...")
-	// Invoke the sender (let it send 1000 events, with 20ms interval between events)
+	// Invoke the sender (let it send `count` events, with 20ms interval between events)
 	// The sender will retry if it cannot send an event
-	resp, err := http.Post(senderUrl + "/send?count=1000&interval=20ms", "text/plain", nil)
+	resp, err := http.Post(fmt.Sprintf("%s/send?count=%d&interval=20ms", senderUrl, count), "text/plain", nil)
 	if err != nil {
 		t.Fatalf("Error invoking sender: %v", err)
 	}
@@ -379,10 +380,10 @@ func sendEvents(t *testing.T, senderUrl string) {
 	}
 }
 
-func verifyEventsReceived(t *testing.T, receiverUrl string) {
+func verifyEventsReceived(t *testing.T, receiverUrl string, total int) {
 	counts := getReceiverReport(t, receiverUrl + "/report")
-	// Every number between <1 and 1000> should be received exactly once
-	for i := 1; i <= 1000; i++ {
+	// Every number between <1 and total> should be received exactly once
+	for i := 1; i <= total; i++ {
 		if counts[i] != 1 {
 			t.Errorf("Event with ID %d should be received exactly once, was %d", i, counts[i])
 		}
@@ -392,6 +393,10 @@ func verifyEventsReceived(t *testing.T, receiverUrl string) {
 /*
 TestSubscriptionReadyBeforeConsumerGroups expects that "make apply" was invoked before
 (it uses the sender and receiver ksvcs created in "foobar" namespace by "make apply")
+
+1. Wait for Subscription to be Ready
+2. Sends 1000 events
+
 */
 func TestSubscriptionReadyBeforeConsumerGroups(t *testing.T) {
 	rand.Seed(time.Now().UnixNano())
@@ -414,21 +419,26 @@ func TestSubscriptionReadyBeforeConsumerGroups(t *testing.T) {
 	// Creates Subscription and wait until it is Ready (and marked as ready in channel subscriber list)
 	prepareSubscription(t, client, kafkaClientSet, subscriptionName, channelName)
 
-	sendEvents(t, senderUrl)
+	sendEvents(t, senderUrl, 1000)
 
 	// 1000 messages with 20ms (50 events/s) => ~20 seconds, let's wait for a minute to let all the events be delivered
 	t.Logf("Sleeping for a minute to let the events flow...")
 	time.Sleep(1 * time.Minute)
 
-	verifyEventsReceived(t, receiverUrl)
+	verifyEventsReceived(t, receiverUrl, 1000)
 }
 
 
 /*
-TestConsumerGroupsNotReadyAfterDispatcherRestart expects that "make apply" was invoked before
+TestDispatcherRestartBeforeCommitedEvents expects that "make apply" was invoked before
 (it uses the sender and receiver ksvcs created in "foobar" namespace by "make apply")
+
+1. Wait for Subscription to be Ready
+2. Restarts kafka-ch-dispatcher
+3. Sends 1000 events
+
 */
-func TestConsumerGroupsNotReadyAfterDispatcherRestart(t *testing.T) {
+func TestDispatcherRestartBeforeCommitedEvents(t *testing.T) {
 	rand.Seed(time.Now().UnixNano())
 
 	// The issue seems to be happening only when the channel is "fresh", (it was not created before)
@@ -465,11 +475,76 @@ func TestConsumerGroupsNotReadyAfterDispatcherRestart(t *testing.T) {
 		}
 	}
 
-	sendEvents(t, senderUrl)
+	sendEvents(t, senderUrl, 1000)
 
 	// 1000 messages with 20ms (50 events/s) => ~20 seconds, let's wait for a minute to let all the events be delivered
 	t.Logf("Sleeping for a minute to let the events flow...")
 	time.Sleep(1 * time.Minute)
 
-	verifyEventsReceived(t, receiverUrl)
+	verifyEventsReceived(t, receiverUrl, 1000)
+}
+
+/*
+TestDispatcherRestartAfterCommitedEvents expects that "make apply" was invoked before
+(it uses the sender and receiver ksvcs created in "foobar" namespace by "make apply")
+
+1. Wait for Subscription to be Ready
+2. Sends 1000 events
+3. Restarts kafka-ch-dispatcher
+4. Sends another 1000 events
+*/
+func TestDispatcherRestartAfterCommitedEvents(t *testing.T) {
+	rand.Seed(time.Now().UnixNano())
+
+	// The issue seems to be happening only when the channel is "fresh", (it was not created before)
+	// So we generate a random name for the channel and the subscription:
+	subscriptionName := appendRandomString("subscription")
+	channelName := appendRandomString("channel")
+
+	client, servingClient, kafkaClientSet := prepareClients(t)
+
+	receiverUrl := prepareReceiver(t, servingClient)
+
+	// Create the KafkaChannel
+	createChannel(t, kafkaClientSet, channelName)
+
+	// Create the SinkBinding for the Sender and waits until Sender is Ready
+	senderUrl := prepareSender(t, client, servingClient, channelName)
+
+	// Creates Subscription and wait until it is Ready (and marked as ready in channel subscriber list)
+	prepareSubscription(t, client, kafkaClientSet, subscriptionName, channelName)
+
+	// Send 1st batch of events
+	sendEvents(t, senderUrl, 1000)
+
+	// 1000 messages with 20ms (50 events/s) => ~20 seconds, let's wait for a minute to let all the events be delivered
+	t.Logf("Sleeping for a minute to let the events flow...")
+	time.Sleep(1 * time.Minute)
+
+	verifyEventsReceived(t, receiverUrl, 1000)
+
+	// Delete the kafka-ch-dispatcher pod
+	kafkaDispatcherList, err := client.Kube.Kube.CoreV1().Pods("knative-eventing").List(
+		context.Background(),
+		meta.ListOptions{LabelSelector: "messaging.knative.dev/channel=kafka-channel,messaging.knative.dev/role=dispatcher"})
+	if err != nil {
+		t.Fatal("Error listing knative-eventing kafka-ch-dispatcher pods", err)
+	}
+
+	for _, kafkaDispatcher := range kafkaDispatcherList.Items {
+		t.Log("Deleting Pod", kafkaDispatcher.Name)
+		err = client.Kube.Kube.CoreV1().Pods("knative-eventing").Delete(context.Background(), kafkaDispatcher.Name, meta.DeleteOptions{})
+		if err != nil {
+			t.Fatal("Error deleting", kafkaDispatcher.Name, err)
+		}
+	}
+
+	// Send 2nd batch of events
+	sendEvents(t, senderUrl, 1000)
+
+	// 1000 messages with 20ms (50 events/s) => ~20 seconds, let's wait for a minute to let all the events be delivered
+	t.Logf("Sleeping for a minute to let the events flow...")
+	time.Sleep(1 * time.Minute)
+
+	verifyEventsReceived(t, receiverUrl, 2000)
 }
