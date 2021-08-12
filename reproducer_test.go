@@ -9,14 +9,14 @@ import (
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
-	kafkachannel "knative.dev/eventing-contrib/kafka/channel/pkg/apis/messaging/v1beta1"
-	eventingcontribkafkachannelversioned "knative.dev/eventing-contrib/kafka/channel/pkg/client/clientset/versioned"
+	kafkachannel "knative.dev/eventing-kafka/pkg/apis/messaging/v1beta1"
+	eventingcontribkafkachannelversioned "knative.dev/eventing-kafka/pkg/client/clientset/versioned"
 	messaging "knative.dev/eventing/pkg/apis/messaging/v1"
-	"knative.dev/eventing/pkg/apis/sources/v1beta1"
+	sources "knative.dev/eventing/pkg/apis/sources/v1"
 	testlib "knative.dev/eventing/test/lib"
 	"knative.dev/pkg/apis"
 	duck "knative.dev/pkg/apis/duck/v1"
-	duckv1beta1 "knative.dev/pkg/apis/duck/v1beta1"
+	_ "knative.dev/pkg/system/testing"
 	pkgTest "knative.dev/pkg/test"
 	"knative.dev/pkg/tracker"
 	servingversioned "knative.dev/serving/pkg/client/clientset/versioned"
@@ -233,18 +233,18 @@ func createChannel(t *testing.T, kafkaClientSet *eventingcontribkafkachannelvers
 
 func prepareSender(t *testing.T, client *testlib.Client, servingClient *servingversioned.Clientset, channelName string) string {
 	// Label the namespace for the SinkBinding
-	_, err := client.Kube.Kube.CoreV1().Namespaces().Patch(context.Background(), namespace, types.StrategicMergePatchType, []byte("{ \"metadata\": { \"labels\": { \"bindings.knative.dev/include\": \"true\" } } }"), meta.PatchOptions{})
+	_, err := client.Kube.CoreV1().Namespaces().Patch(context.Background(), namespace, types.StrategicMergePatchType, []byte("{ \"metadata\": { \"labels\": { \"bindings.knative.dev/include\": \"true\" } } }"), meta.PatchOptions{})
 	if err != nil {
 		t.Fatalf("error patching namespace %q: %v", namespace, err)
 	}
 
 	// Create SinkBinding for the Sender ksvc (we name it the same as the channel)
-	_, err = client.Eventing.SourcesV1beta1().SinkBindings(namespace).Create(context.Background(), &v1beta1.SinkBinding{
+	_, err = client.Eventing.SourcesV1().SinkBindings(namespace).Create(context.Background(), &sources.SinkBinding{
 		ObjectMeta: meta.ObjectMeta{
 			Name: channelName,
 		},
-		Spec: v1beta1.SinkBindingSpec{
-			BindingSpec: duckv1beta1.BindingSpec{
+		Spec: sources.SinkBindingSpec{
+			BindingSpec: duck.BindingSpec{
 				Subject: tracker.Reference{
 					APIVersion: "serving.knative.dev/v1",
 					Kind:       "Service",
@@ -390,6 +390,44 @@ func verifyEventsReceived(t *testing.T, receiverUrl string, total int) {
 	}
 }
 
+func restartKafkaChannelDispatcher(t *testing.T, client *testlib.Client) {
+	kafkaDispatcherList, err := client.Kube.CoreV1().Pods("knative-eventing").List(
+		context.Background(),
+		meta.ListOptions{LabelSelector: "messaging.knative.dev/channel=kafka-channel,messaging.knative.dev/role=dispatcher"})
+	if err != nil {
+		t.Fatal("Error listing knative-eventing kafka-ch-dispatcher pods", err)
+	}
+
+	for _, kafkaDispatcher := range kafkaDispatcherList.Items {
+		t.Log("Deleting Pod", kafkaDispatcher.Name)
+		err = client.Kube.CoreV1().Pods("knative-eventing").Delete(context.Background(), kafkaDispatcher.Name, meta.DeleteOptions{})
+		if err != nil {
+			t.Fatal("Error deleting", kafkaDispatcher.Name, err)
+		}
+	}
+}
+
+// restartKafka restarts one of the Kafka pods, it expects it exists in the "kafka" namespace
+func restartKafka(t *testing.T, client *testlib.Client) {
+	kafkaList, err := client.Kube.CoreV1().Pods("kafka").List(
+		context.Background(),
+		meta.ListOptions{LabelSelector: "app.kubernetes.io/name=kafka"})
+	if err != nil {
+		t.Fatal("Error listing kafka 'app.kubernetes.io/name=kafka' pods", err)
+	}
+
+	if len(kafkaList.Items) == 0 {
+		t.Fatal("No 'app.kubernetes.io/name=kafka' pods in kafka namespace")
+	}
+
+	kafka := kafkaList.Items[0]
+	t.Log("Deleting Pod", kafka.Name)
+	err = client.Kube.CoreV1().Pods("kafka").Delete(context.Background(), kafka.Name, meta.DeleteOptions{})
+	if err != nil {
+		t.Fatal("Error deleting", kafka.Name, err)
+	}
+}
+
 /*
 TestSubscriptionReadyBeforeConsumerGroups expects that "make apply" was invoked before
 (it uses the sender and receiver ksvcs created in "foobar" namespace by "make apply")
@@ -421,9 +459,9 @@ func TestSubscriptionReadyBeforeConsumerGroups(t *testing.T) {
 
 	sendEvents(t, senderUrl, 1000)
 
-	// 1000 messages with 20ms (50 events/s) => ~20 seconds, let's wait for a minute to let all the events be delivered
-	t.Logf("Sleeping for a minute to let the events flow...")
-	time.Sleep(1 * time.Minute)
+	// 1000 messages with 20ms (50 events/s) => ~20 seconds, let's wait for two minutes to let all the events be delivered
+	t.Logf("Sleeping for 2 minutes to let the events flow...")
+	time.Sleep(2 * time.Minute)
 
 	verifyEventsReceived(t, receiverUrl, 1000)
 }
@@ -460,26 +498,13 @@ func TestDispatcherRestartBeforeCommitedEvents(t *testing.T) {
 	prepareSubscription(t, client, kafkaClientSet, subscriptionName, channelName)
 
 	// Delete the kafka-ch-dispatcher pod
-	kafkaDispatcherList, err := client.Kube.Kube.CoreV1().Pods("knative-eventing").List(
-		context.Background(),
-		meta.ListOptions{LabelSelector: "messaging.knative.dev/channel=kafka-channel,messaging.knative.dev/role=dispatcher"})
-	if err != nil {
-		t.Fatal("Error listing knative-eventing kafka-ch-dispatcher pods", err)
-	}
-
-	for _, kafkaDispatcher := range kafkaDispatcherList.Items {
-		t.Log("Deleting Pod", kafkaDispatcher.Name)
-		err = client.Kube.Kube.CoreV1().Pods("knative-eventing").Delete(context.Background(), kafkaDispatcher.Name, meta.DeleteOptions{})
-		if err != nil {
-			t.Fatal("Error deleting", kafkaDispatcher.Name, err)
-		}
-	}
+	restartKafkaChannelDispatcher(t, client)
 
 	sendEvents(t, senderUrl, 1000)
 
-	// 1000 messages with 20ms (50 events/s) => ~20 seconds, let's wait for a minute to let all the events be delivered
-	t.Logf("Sleeping for a minute to let the events flow...")
-	time.Sleep(1 * time.Minute)
+	// 1000 messages with 20ms (50 events/s) => ~20 seconds, let's wait for two minutes to let all the events be delivered
+	t.Logf("Sleeping for two minutes to let the events flow...")
+	time.Sleep(2 * time.Minute)
 
 	verifyEventsReceived(t, receiverUrl, 1000)
 }
@@ -524,27 +549,58 @@ func TestDispatcherRestartAfterCommitedEvents(t *testing.T) {
 	verifyEventsReceived(t, receiverUrl, 1000)
 
 	// Delete the kafka-ch-dispatcher pod
-	kafkaDispatcherList, err := client.Kube.Kube.CoreV1().Pods("knative-eventing").List(
-		context.Background(),
-		meta.ListOptions{LabelSelector: "messaging.knative.dev/channel=kafka-channel,messaging.knative.dev/role=dispatcher"})
-	if err != nil {
-		t.Fatal("Error listing knative-eventing kafka-ch-dispatcher pods", err)
-	}
-
-	for _, kafkaDispatcher := range kafkaDispatcherList.Items {
-		t.Log("Deleting Pod", kafkaDispatcher.Name)
-		err = client.Kube.Kube.CoreV1().Pods("knative-eventing").Delete(context.Background(), kafkaDispatcher.Name, meta.DeleteOptions{})
-		if err != nil {
-			t.Fatal("Error deleting", kafkaDispatcher.Name, err)
-		}
-	}
+	restartKafkaChannelDispatcher(t, client)
 
 	// Send 2nd batch of events
 	sendEvents(t, senderUrl, 1000)
 
-	// 1000 messages with 20ms (50 events/s) => ~20 seconds, let's wait for a minute to let all the events be delivered
-	t.Logf("Sleeping for a minute to let the events flow...")
-	time.Sleep(1 * time.Minute)
+	// 1000 messages with 20ms (50 events/s) => ~20 seconds, let's wait for two minutes to let all the events be delivered
+	t.Logf("Sleeping for two minutes to let the events flow...")
+	time.Sleep(2 * time.Minute)
+
+	verifyEventsReceived(t, receiverUrl, 2000)
+}
+
+
+func TestKafkaRestart(t *testing.T) {
+	rand.Seed(time.Now().UnixNano())
+
+	// The issue seems to be happening only when the channel is "fresh", (it was not created before)
+	// So we generate a random name for the channel and the subscription:
+	subscriptionName := appendRandomString("subscription")
+	channelName := appendRandomString("channel")
+
+	client, servingClient, kafkaClientSet := prepareClients(t)
+
+	receiverUrl := prepareReceiver(t, servingClient)
+
+	// Create the KafkaChannel
+	createChannel(t, kafkaClientSet, channelName)
+
+	// Create the SinkBinding for the Sender and waits until Sender is Ready
+	senderUrl := prepareSender(t, client, servingClient, channelName)
+
+	// Creates Subscription and wait until it is Ready (and marked as ready in channel subscriber list)
+	prepareSubscription(t, client, kafkaClientSet, subscriptionName, channelName)
+
+	// Send 1st batch of events
+	sendEvents(t, senderUrl, 1000)
+
+	// 1000 messages with 20ms (50 events/s) => ~20 seconds, let's wait for two minutes to let all the events be delivered
+	t.Logf("Sleeping for two minutes to let the events flow...")
+	time.Sleep(2 * time.Minute)
+
+	verifyEventsReceived(t, receiverUrl, 1000)
+
+	// Delete one of the Kafka pods
+	restartKafka(t, client)
+
+	// Send 2nd batch of events
+	sendEvents(t, senderUrl, 1000)
+
+	// 1000 messages with 20ms (50 events/s) => ~20 seconds, let's wait for two minutes to let all the events be delivered
+	t.Logf("Sleeping for two minutes to let the events flow...")
+	time.Sleep(2 * time.Minute)
 
 	verifyEventsReceived(t, receiverUrl, 2000)
 }
