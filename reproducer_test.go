@@ -301,7 +301,7 @@ func prepareSubscription(t *testing.T, client *testlib.Client, kafkaClientSet *e
 			Name: subscriptionName,
 		},
 		Spec: messaging.SubscriptionSpec{
-			Channel: core.ObjectReference{
+			Channel: duck.KReference{
 				APIVersion: "messaging.knative.dev/v1beta1",
 				Kind:       "KafkaChannel",
 				Name:       channelName,
