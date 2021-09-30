@@ -13,6 +13,7 @@ To deploy, first build and deploy sender and receiver ksvcs (will be created in 
 
 Then run the test (which creates a KafkaChannel, SinkBinding and a Subscription, and invokes the sender to start sending events
 once the channel's subscriber is Ready)
+* `export SYSTEM_NAMESPACE=knative-eventing`
 * `go test -v`
 
 The test then invokes the sender ksvc to start producing events (1000 in total).
